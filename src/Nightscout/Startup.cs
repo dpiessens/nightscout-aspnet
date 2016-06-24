@@ -60,6 +60,7 @@ namespace Nightscout
 
             // Setup the database connection as a singleton
             ConfigureDatabase(services);
+            ConfigureCache(services);
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
@@ -75,6 +76,12 @@ namespace Nightscout
             {
                 r.MapRoute("default", "api/v1/{controller=Entries}.{format?}/{action=Get}");
             });
+        }
+
+        private void ConfigureCache(IServiceCollection services)
+        {
+            //TODO: Add Redis cache for multiple instances
+            services.AddDistributedMemoryCache();
         }
 
         private void ConfigureDatabase(IServiceCollection services)

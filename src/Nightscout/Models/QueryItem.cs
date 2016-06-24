@@ -13,9 +13,9 @@
         /// <param name="comparitor">The comparitor, defaults to equals.</param>
         public QueryItem(string field, string value, string comparitor = null)
         {
-            Field = field;
+            Field = field?.ToLowerInvariant().Trim() ?? string.Empty;
             Value = value;
-            Comparitor = comparitor;
+            Comparitor = comparitor?.ToLowerInvariant().Trim().TrimStart('$') ?? "eq";
         }
 
         public string Field { get; private set; }

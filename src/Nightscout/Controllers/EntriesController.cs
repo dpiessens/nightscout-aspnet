@@ -1,16 +1,19 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Mvc.Internal;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
-using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
+using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
-using MongoDB.Driver.Core.Configuration;
 using Newtonsoft.Json;
-using Nightscout.Binders;
 using Nightscout.Entitites;
 using Nightscout.Models;
+using Nightscout.Utilities;
 
 namespace Nightscout.Controllers
 {
@@ -19,13 +22,18 @@ namespace Nightscout.Controllers
     /// </summary>
     public class EntriesController : Controller
     {
+        private const int CacheLimit = 288;
+        private static readonly string KeyProperty = "type";
+
         private readonly IMongoDatabase _database;
         private readonly ILogger<EntriesController> _logger;
+        private readonly IMemoryCache _localCache;
 
-        public EntriesController(IMongoDatabase database, ILogger<EntriesController> logger)
+        public EntriesController(IMongoDatabase database, ILogger<EntriesController> logger, IMemoryCache localCache)
         {
             _database = database;
             _logger = logger;
+            _localCache = localCache;
         }
 
         /// <summary>
@@ -82,37 +90,180 @@ namespace Nightscout.Controllers
         //[SwaggerResponse(200, type: typeof(Entries))]
         public async Task<IActionResult> Get(QueryFilter find, [FromQuery] int? count)
         {
-            var collection = this._database.GetCollection<EntryEntity>("entries");
+            return await QueryWithCache(find, count, "sgv");
+        }
 
-            var query = CreateQuery(find);
-            var results = await collection.Find(query).SortByDescending(s => s.Date).Limit(20).ToListAsync();
+        private async Task<IActionResult> QueryWithCache(QueryFilter find, int? count, string defaultKeyValue)
+        {
+            int extraFields;
+            var keyField = GetKeyField(find, KeyProperty, defaultKeyValue, out extraFields);
+            var cacheKey = $"entries-{keyField}";
+            if (extraFields == 0 && count.GetValueOrDefault() <= CacheLimit) // TODO configure cache limit
+            {
+                List<EntryEntity> result;
+                if (_localCache.TryGetValue(cacheKey, out result))
+                {
+                    _logger.LogDebug("Returning query from cache with key {0}", cacheKey);
+                    if (count.HasValue && count < CacheLimit)
+                    {
+                        _logger.LogDebug("Limiting cache results to {0} entries", count);
+                        result = result.OrderByDescending(r => r.Date).Take(count.Value).ToList();
+                    }
+
+                    return new ObjectResult(result);
+                }
+            }
+
+            var collection = this._database.GetCollection<EntryEntity>("entries");
+            var query = CreateQuery<EntryEntity>(find, KeyProperty, defaultKeyValue, ConvertDateQuery);
+            var results = await collection.Find(query).SortByDescending(s => s.Date).Limit(count).ToListAsync();
+
+            // Populate cache for now if value equals max count
+            if (extraFields == 0 && count.GetValueOrDefault() == CacheLimit)
+            {
+                _localCache.Set(cacheKey, results);
+            }
 
             return new ObjectResult(results);
         }
 
-        private static FilterDefinition<EntryEntity> CreateQuery(QueryFilter query)
+        private static Tuple<string, object> ConvertDateQuery(string name, string value)
         {
-            var filter =  Builders<EntryEntity>.Filter;
+            // Convert date string to more performant query
+            if (string.Equals(name, "datestring", StringComparison.OrdinalIgnoreCase))
+            {
+                return new Tuple<string, object>("date", value.ToJavaScriptDate());
+            }
+
+            return null;
+        }
+
+        private static string GetKeyField(QueryFilter filter, string fieldName, string defaultValue, out int additionalFieldCount)
+        {
+            additionalFieldCount = 0;
+            foreach (var item in filter.Filters)
+            {
+                if (string.Equals(item.Field, fieldName))
+                {
+                    return item.Value;
+                }
+                else
+                {
+                    additionalFieldCount++;
+                }
+            }
+
+            return defaultValue;
+        }
+
+        private static FilterDefinition<TEntity> CreateQuery<TEntity>(QueryFilter query, string keyField, string defaultValue, 
+            Func<string, string, Tuple<string, object>> remapFilter = null) where TEntity : class
+        {
+            var filter =  Builders<TEntity>.Filter;
             var hasType = false;
 
-            var list = new List<FilterDefinition<EntryEntity>>();
+            var list = new List<FilterDefinition<TEntity>>();
+            var reflectCache = GetFieldMapping<TEntity>();
+            
             foreach (var item in query.Filters)
             {
-                switch (item.Field.ToLowerInvariant().Trim())
+                var fieldName = item.Field;
+                object fieldValue = item.Value;
+                var remap = remapFilter?.Invoke(fieldName, item.Value);
+                if (remap != null)
                 {
-                    case "type":
-                        list.Add(filter.Eq(e => e.Type, item.Value));
-                        hasType = true;
-                        break;
+                    fieldName = remap.Item1;
+                    fieldValue = remap.Item2;
+                }
+
+                Tuple<Type, object> fieldDefinition;
+                if (!reflectCache.TryGetValue(fieldName, out fieldDefinition))
+                {
+                    throw new InvalidOperationException($"Cannot locate query field: {fieldName}");
+                }
+
+                if (!hasType && string.Equals(fieldName, keyField, StringComparison.OrdinalIgnoreCase))
+                {
+                    hasType = true;
+                }
+
+                var method = filter.GetType().GetMethods().FirstOrDefault(m => 
+                        string.Equals(m.Name, item.Comparitor, StringComparison.OrdinalIgnoreCase) && 
+                        typeof(FieldDefinition<,>) == m.GetParameters().First().ParameterType.GetGenericTypeDefinition());
+
+                var result = method?.MakeGenericMethod(fieldDefinition.Item1)
+                    .Invoke(filter, new[] { fieldDefinition.Item2, fieldValue }) as FilterDefinition<TEntity>;
+
+                if (result != null)
+                {
+                    list.Add(result);
                 }
             }
 
             if (!hasType)
             {
-                filter = filter.And()Eq(f => f.Type, "sgv");
+                list.Add(filter.Eq(keyField, defaultValue));
             }
 
-            return filter;
+            if (list.Count > 1)
+            {
+                return filter.And(list);
+            }
+
+            return list.Count == 1 ? list.First() : filter.Empty;
+        }
+
+        private static IDictionary<string, Tuple<Type, object>> GetFieldMapping<TEntity>() where TEntity : class
+        {
+            var fieldMappings = new Dictionary<string, Tuple<Type, object>>(StringComparer.OrdinalIgnoreCase);
+
+            var properties = typeof(TEntity).GetProperties();
+
+            foreach (var propertyInfo in properties)
+            {
+                // Skip ID properties
+                var idProp = propertyInfo.GetCustomAttribute<BsonIdAttribute>();
+                if (idProp != null)
+                {
+                    continue;
+                }
+
+                var propertyName = propertyInfo.Name;
+                var customName = GetNameForProperty(propertyInfo);
+
+                var genericDef = typeof(StringFieldDefinition<,>);
+                var specificDef = genericDef.MakeGenericType(typeof(TEntity), propertyInfo.PropertyType);
+                var serializerType = typeof(IBsonSerializer<>).MakeGenericType(propertyInfo.PropertyType);
+                var constructorInfo = specificDef.GetConstructors().First();
+                var lambda = Expression.Lambda<Func<object>>(Expression.Convert(Expression.New(constructorInfo, Expression.Constant(customName, typeof(string)), Expression.Default(serializerType)), typeof(object)));
+                
+                var fieldDef = new Tuple<Type, object>(propertyInfo.PropertyType, lambda.Compile()());
+
+                if (!fieldMappings.ContainsKey(propertyName))
+                {
+                    fieldMappings.Add(propertyName, fieldDef);
+                }
+
+                if (!string.Equals(customName, propertyName, StringComparison.OrdinalIgnoreCase) &&
+                    !fieldMappings.ContainsKey(customName))
+                {
+                    fieldMappings.Add(customName, fieldDef);
+                }
+            }
+
+            return fieldMappings;
+        }
+
+        private static string GetNameForProperty(MemberInfo propertyInfo)
+        {
+            var customName = propertyInfo.Name;
+
+            var bsonAttribute = propertyInfo.GetCustomAttribute<BsonElementAttribute>();
+            if (bsonAttribute != null)
+            {
+                customName = bsonAttribute.ElementName;
+            }
+            return customName;
         }
 
 
@@ -128,15 +279,9 @@ namespace Nightscout.Controllers
         [HttpGet("/{spec}")]
         //[SwaggerOperation("EntriesSpecGet")]
         //[SwaggerResponse(200, type: typeof(Entries))]
-        public IActionResult EntriesSpecGet([FromRoute] string spec, [FromQuery] string find, [FromQuery] double? count)
+        public async Task<IActionResult> EntriesSpecGet([FromRoute] string spec, QueryFilter find, [FromQuery] int? count)
         {
-            string exampleJson = null;
-
-            var example = exampleJson != null
-                ? JsonConvert.DeserializeObject<Entries>(exampleJson)
-                : default(Entries);
-
-            return new ObjectResult(example);
+            return await QueryWithCache(find, count, spec);
         }
 
 
